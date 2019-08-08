@@ -2,6 +2,7 @@
 ###                      utility.py                         ###
 ###############################################################
 import os
+import numpy as np
 import pandas as pd
 import datetime as dt
 
@@ -35,6 +36,26 @@ def parse_float(x, keep=2):
         return round(float(x), 2)
     except ValueError:
         return None
+
+def truncate(x, lower_quantile=None, upper_quantile=None, lower_bound=None, upper_bound=None):
+    res = x.copy()
+    assert lower_quantile is None or lower_bound is None, 'Conflict on lower bound.'
+    assert upper_quantile is None or upper_bound is None, 'Conflict on upper bound.'
+    if lower_quantile is not None:
+        lower_bound = np.percentile(x, lower_quantile)
+    if lower_bound is not None:
+        res[res < lower_bound] = lower_bound
+    if upper_quantile is not None:
+        upper_bound = np.percentile(x, upper_quantile)
+    if upper_bound is not None:
+        res[res > upper_bound] = upper_bound
+    return res
+
+def slice_df_on(df1, df2, on):
+    idx1 = df1[on].reset_index()
+    idx2 = df2[on].reset_index()
+    idx = idx1.merge(idx2, on=on)
+    print(idx)
 
 def clean_weekly_gb_data(path):
     data = pd.read_csv(path)

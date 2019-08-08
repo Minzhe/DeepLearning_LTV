@@ -66,7 +66,7 @@ employee_invites AS (
         count(distinct e.uuid) AS n_invited
     FROM u4b.initech_employees e
     JOIN eligible_organization o ON o.uuid = e.organization_uuid
-    WHERE e.confirmed_at IS NOT NULL
+    -- WHERE e.confirmed_at IS NOT NULL
     GROUP BY 1,2
 ),
 
