@@ -4,8 +4,9 @@
 import os
 import numpy as np
 import pandas as pd
-from keras.models import Model, load_model
-from keras.layers import Input, Dense, Dropout, Flatten, Concatenate
+from keras.models import Model, load_model, Sequential
+from keras.layers import Input, Dense, ReLU, multiply, add
+from keras.layers import BatchNormalization, Flatten, Concatenate, Dropout
 from keras.layers import Conv1D, MaxPooling1D, GlobalMaxPooling1D, LSTM
 from keras.optimizers import Adam
 from keras.callbacks import EarlyStopping, ModelCheckpoint, TensorBoard, ReduceLROnPlateau
@@ -13,6 +14,20 @@ from keras.regularizers import l1, l2
 from keras.utils import plot_model
 import keras.backend as K
 import tensorflow as tf
+
+#################################    function    ###################################
+def DenseNorm(units, dropout):
+    model = Sequential()
+    model.add(Dense(units))
+    model.add(BatchNormalization())
+    model.add(ReLU())
+    if dropout > 0:
+        model.add(Dropout(dropout))
+    model.name = model.name.replace('sequential', 'dense_norm')
+    return model
+
+def unit_decay(units, i):
+    return int(2 * units / (i + 1))
 
 
 #################################    model    ###################################
@@ -23,23 +38,111 @@ class neural_net(object):
     '''
     Neural network model.
     '''
-    def __init__(self, ts_len, input_len, output_len, loss, lr):
+    def __init__(self, ts_len, t_len, geo_len, org_len, output_len, loss, lr):
         self.ts_len = ts_len
-        self.input_len = input_len
+        self.t_len = t_len
+        self.geo_len = geo_len
+        self.org_len = org_len
+        self.input_len = f'{self.ts_len}.{self.t_len}.{self.geo_len}.{self.org_len}'
+        self.output_len = output_len
+        assert loss in ['mse', 'weighted_mse'], 'Unrecognizable loss function.'
         if loss == 'mse':
             self.loss = 'mse'
             self.loss_name = 'mse'
         elif loss == 'weighted_mse':
             self.loss = self.weighted_mse
             self.loss_name = 'weighted_mse'
-        else:
-            raise ValueError('Unrecognizable loss function.')
-        self.output_len = output_len
         self.lr = lr
+        self.conv_pool_layer = []
+        self.lstm_layer = []
+        self.fc_layer_ts = []
+        self.fc_layer = []
         self.layer_name = ''
 
-    def build(self, inputs, outputs):
-        model = Model(inputs=inputs, outputs=outputs)
+    def _build(self, struc):
+        '''
+        Initialize neural network model
+        '''
+        # time series features
+        ts_inputs, ts_layer = [], []
+        if struc == 'cnn':
+            print('Initializing cnn model ...', flush=True)
+            for i, tl in enumerate(self.ts_len, 1):
+                ts_in = Input(shape=(tl, 1), name='ts_input' + str(i))
+                ts_inputs.append(ts_in)
+                ts = ts_in
+                for filters, kernel_size, pool_size in self.conv_pool_layer:
+                    ts = Conv1D(filters=unit_decay(filters, i), kernel_size=kernel_size, padding='same', activation='relu', strides=1)(ts)
+                    if pool_size is not None:
+                        assert isinstance(pool_size, int), 'Unrecognizable pool_size: {}'.format(pool_size)
+                        if pool_size > 0:
+                            ts = MaxPooling1D(pool_size=pool_size)(ts)
+                        elif pool_size == -1:
+                            ts = GlobalMaxPooling1D()(ts)
+                ts = ts if len(K.int_shape(ts)) == 2 else Flatten()(ts)
+                ts_layer.append(ts)
+        elif struc == 'lstm':
+            print('Initializing lstm model ...', flush=True)
+            for i, tl in enumerate(self.ts_len, 1):
+                ts_in = Input(shape=(tl, 1), name='ts_input' + str(i))
+                ts_inputs.append(ts_in)
+                ts = ts_in
+                for j, (units, drop, rec_drop) in enumerate(self.lstm_layer):
+                    if j < len(self.lstm_layer) - 1:
+                        ts = LSTM(units=unit_decay(units, i), return_sequences=True, dropout=drop, recurrent_dropout=rec_drop)(ts)
+                    else:
+                        ts = LSTM(units=unit_decay(units, i), return_sequences=False, dropout=drop, recurrent_dropout=rec_drop)(ts)
+                ts_layer.append(ts)
+        elif struc == 'cnn_lstm':
+            print('Initializing cnn model ...', flush=True)
+            for i, tl in enumerate(self.ts_len, 1):
+                ts_in = Input(shape=(tl, 1), name='ts_input' + str(i))
+                ts_inputs.append(ts_in)
+                ts = ts_in
+                for filters, kernel_size, pool_size in self.conv_pool_layer:
+                    ts = Conv1D(filters=unit_decay(filters, i), kernel_size=kernel_size, padding='same', activation='relu', strides=1)(ts)
+                    if pool_size is not None:
+                        assert isinstance(pool_size, int) and pool_size > 0, 'Unrecognizable pool_size: {}'.format(pool_size)
+                        ts = MaxPooling1D(pool_size=pool_size)(ts)
+                for j, (units, drop, rec_drop) in enumerate(self.lstm_layer):
+                    if j < len(self.lstm_layer) - 1:
+                        ts = LSTM(units=unit_decay(units, i), return_sequences=True, dropout=drop, recurrent_dropout=rec_drop)(ts)
+                    else:
+                        ts = LSTM(units=unit_decay(units, i), return_sequences=False, dropout=drop, recurrent_dropout=rec_drop)(ts)
+                ts_layer.append(ts)
+        elif struc == 'fnn':
+            print('Initializing feedforward model ...', flush=True)
+            for i, tl in enumerate(self.ts_len, 1):
+                ts_in = Input(shape=(tl, 1), name='ts_input' + str(i))
+                ts_inputs.append(ts_in)
+                ts = ts_in if len(K.int_shape(ts_in)) == 2 else Flatten()(ts_in)
+                for units, dropout in self.fc_layer_ts:
+                    ts = DenseNorm(unit_decay(units, i), dropout)(ts)
+                ts_layer.append(ts)
+        ts_layer = Concatenate()(ts_layer)
+        # time modulator features
+        t_input = Input(shape=(self.t_len,), name='t_input')
+        time = Dense(8, activation='relu')(t_input)
+        time = Dense(16, activation='relu')(time)
+        ts_shape = K.int_shape(ts_layer)[1]
+        gamma = Dense(ts_shape, activation='sigmoid')(time)
+        beta = Dense(ts_shape, activation='tanh')(time)
+        ts_layer = add([multiply([ts_layer, gamma]), beta])
+        # geographical features
+        geo_input = Input(shape=(self.geo_len,), name='geo_input')
+        geo_layer = DenseNorm(128, 0.2)(geo_input)
+        geo_layer = DenseNorm(64, 0)(geo_layer)
+        # org feature
+        org_input = Input(shape=(self.org_len,), name='org_input')
+        org_layer = DenseNorm(16, 0.1)(org_input)
+        org_layer = DenseNorm(16, 0)(org_layer)
+        # fully connected layer
+        fc_layer = Concatenate()([ts_layer, geo_layer, org_layer])
+        for units, dropout in self.fc_layer:
+            fc_layer = DenseNorm(units, dropout)(fc_layer)
+        output = Dense(self.output_len, activation='linear')(fc_layer)
+        # model
+        model = Model(inputs=ts_inputs + [t_input, geo_input, org_input], outputs=output)
         model.compile(loss=self.loss, optimizer=Adam(lr=self.lr), metrics=[self.r2, self.mae, self.exp2_mae])
         print('Model structure summary:', flush=True)
         print(model.summary())
@@ -49,10 +152,10 @@ class neural_net(object):
         self.batch_size = batch_size
         self.epoch = epoch
         self.tol = tolerance
-        self.model_name = f'{model_name}@ts_{self.ts_len}|in_{self.input_len}|out_{self.output_len}|{self.layer_name}|loss_{self.loss_name}|lr_{self.lr}|batch_{self.batch_size}'.replace(' ', '')
+        self.model_name = f'{model_name}@in.{self.input_len}-out.{self.output_len}-{self.layer_name}-loss.{self.loss_name}-lr.{self.lr}-batch.{self.batch_size}'.replace(' ', '')
         self.model_path = os.path.join(save_dir, '{}.h5'.format(self.model_name))
-        # self.model_fig = os.path.join(save_dir, '{}.png'.format(self.model_name))
-        # plot_model(self.model, self.model_fig)
+        self.model_fig = os.path.join(save_dir, '{}.png'.format(self.model_name))
+        plot_model(self.model, self.model_fig, show_shapes=True)
         self.log_dir = os.path.join(save_dir, '{}.log'.format(self.model_name))
         if not os.path.isdir(self.log_dir): os.mkdir(self.log_dir)
 
@@ -79,23 +182,23 @@ class neural_net(object):
         else:
             raise ValueError('Index out of range.')
 
-    def evaluate(self, dgr, name, mode='full'):
+    def evaluate(self, dgr, name, mode='full', ci=False):
         print('Calculating metrices of {} model ...'.format(name))
         res = dict()
-        res[name + '_train'] = self.cal_metrics(y_true=dgr.resp_train, y_pred=dgr.pred_train, weight=dgr.weight_train, mode=mode)
-        res[name+'_val'] = self.cal_metrics(y_true=dgr.resp_val, y_pred=dgr.pred_val, weight=dgr.weight_val, mode=mode)
-        res[name+'_test'] = self.cal_metrics(y_true=dgr.resp_test, y_pred=dgr.pred_test, weight=dgr.weight_test, mode=mode)
+        res[name+'_train'] = self.cal_metrics(y_true=dgr.resp_train, y_pred=dgr.pred_train, weight=dgr.weight_train, mode=mode, ci=ci)
+        res[name+'_val'] = self.cal_metrics(y_true=dgr.resp_val, y_pred=dgr.pred_val, weight=dgr.weight_val, mode=mode, ci=ci)
+        res[name+'_test'] = self.cal_metrics(y_true=dgr.resp_test, y_pred=dgr.pred_test, weight=dgr.weight_test, mode=mode, ci=ci)
         return pd.DataFrame(res).T
 
-    def evaluate_mean_guess(self, dgr, mode='full'):
+    def evaluate_mean_guess(self, dgr, mode='full', ci=False):
         print('Calculating metrices of mean guess model ...')
         res = dict()
-        res['REF_MEAN_train'] = self.cal_metrics(y_true=dgr.resp_train, y_pred=np.ones(shape=dgr.resp_train.shape), weight=dgr.weight_train, mode=mode)
-        res['REF_MEAN_val'] = self.cal_metrics(y_true=dgr.resp_val, y_pred=np.ones(shape=dgr.resp_val.shape), weight=dgr.weight_val, mode=mode)
-        res['REF_MEAN_test'] = self.cal_metrics(y_true=dgr.resp_test, y_pred=np.ones(shape=dgr.resp_test.shape), weight=dgr.weight_test, mode=mode)
+        res['REF_MEAN_train'] = self.cal_metrics(y_true=dgr.resp_train, y_pred=np.ones(shape=dgr.resp_train.shape), weight=dgr.weight_train, mode=mode, ci=ci)
+        res['REF_MEAN_val'] = self.cal_metrics(y_true=dgr.resp_val, y_pred=np.ones(shape=dgr.resp_val.shape), weight=dgr.weight_val, mode=mode, ci=ci)
+        res['REF_MEAN_test'] = self.cal_metrics(y_true=dgr.resp_test, y_pred=np.ones(shape=dgr.resp_test.shape), weight=dgr.weight_test, mode=mode, ci=ci)
         return pd.DataFrame(res).T
 
-    def evaluate_gaussian_sample(self, dgr, mode='full', epoch=10):
+    def evaluate_gaussian_sample(self, dgr, mode='full', epoch=10, ci=False):
         print('Calculating metrices of gaussian sampling model ', end='', flush=True)
         pred_train = np.array([np.random.normal(loc=miu, scale=np.sqrt(sigma2), size=epoch) for (miu, sigma2) in zip(dgr.resp_train, dgr.var_train)]).T
         pred_val = np.array([np.random.normal(loc=miu, scale=np.sqrt(sigma2), size=epoch) for (miu, sigma2) in zip(dgr.resp_val, dgr.var_val)]).T
@@ -104,27 +207,32 @@ class neural_net(object):
         for i in range(epoch):
             print('.', end='', flush=True)
             tmp = dict()
-            tmp['REF_GS_train'] = self.cal_metrics(y_true=dgr.resp_train, y_pred=pred_train[i,:], weight=dgr.weight_train, mode=mode)
-            tmp['REF_GS_val'] = self.cal_metrics(y_true=dgr.resp_val, y_pred=pred_val[i,:], weight=dgr.weight_val, mode=mode)
-            tmp['REF_GS_test'] = self.cal_metrics(y_true=dgr.resp_test, y_pred=pred_test[i,:], weight=dgr.weight_test, mode=mode)
+            tmp['REF_GS_train'] = self.cal_metrics(y_true=dgr.resp_train, y_pred=pred_train[i,:], weight=dgr.weight_train, mode=mode, ci=ci)
+            tmp['REF_GS_val'] = self.cal_metrics(y_true=dgr.resp_val, y_pred=pred_val[i,:], weight=dgr.weight_val, mode=mode, ci=ci)
+            tmp['REF_GS_test'] = self.cal_metrics(y_true=dgr.resp_test, y_pred=pred_test[i,:], weight=dgr.weight_test, mode=mode, ci=ci)
             res.append(pd.DataFrame(tmp).T)
         res = pd.concat(res)
         print(' ')
         return res.groupby(by=res.index).mean()
 
-    def cal_metrics(self, y_true, y_pred, weight, mode):
+    def cal_metrics(self, y_true, y_pred, weight, mode, ci):
         ptg_true = np.exp2(y_true) - 1
         ptg_pred = np.exp2(y_pred) - 1
         mae = np.mean(np.abs(ptg_true - ptg_pred) * weight)
         mape = np.mean(np.abs(ptg_true - ptg_pred))
         male = np.mean(np.log2(np.abs(ptg_true - ptg_pred) * weight + 1))
         maple = np.mean(np.abs(y_true - y_pred))
-        pci = self.concordance_index(ptg_true, ptg_pred, mode)
         top10pi = self.top_inclusion(ptg_true, ptg_pred, 10)
         top10mae = self.top_mae(ptg_true * weight, ptg_pred * weight, weight, 10)
         top10mape = self.top_mae(ptg_true, ptg_pred, weight, 10)
-        return pd.Series([mae, male, mape, maple, pci, top10pi, top10mae, top10mape],
-                         index=['MAE', 'MALE', 'MAPE', 'MAPLE', 'PCI', 'PI10', 'MAE10', 'MAPE10'])
+        if ci:
+            pci = self.concordance_index(ptg_true, ptg_pred, mode)
+            return pd.Series([mae, male, mape, maple, pci, top10pi, top10mae, top10mape],
+                             index=['MAE', 'MALE', 'MAPE', 'MAPLE', 'PCI', 'PI10', 'MAE10', 'MAPE10'])
+        else:
+            return pd.Series([mae, male, mape, maple, top10pi, top10mae, top10mape],
+                             index=['MAE', 'MALE', 'MAPE', 'MAPLE', 'PI10', 'MAE10', 'MAPE10'])
+
 
     # --------------  utility function  ---------------- #
     @staticmethod
@@ -196,60 +304,20 @@ class cnn(neural_net):
     '''
     Convolutional neural network.
     '''
-    def __init__(self, ts_len, input_len, output_len, conv_pool_layer, fc_layer, loss, lr):
+    def __init__(self, ts_len, t_len, geo_len, org_len, output_len, conv_pool_layer, fc_layer, loss, lr):
         '''
         conv_pool_layer:
             list of (filters, kernel_size, pool_size)
         fc_layer:
             list of (units, dropout, regularize)
         '''
-        super().__init__(ts_len=ts_len, input_len=input_len, output_len=output_len, loss=loss, lr=lr)
+        super().__init__(ts_len=ts_len, t_len=t_len, geo_len=geo_len, org_len=org_len, output_len=output_len, loss=loss, lr=lr)
         self.conv_pool_layer = conv_pool_layer
         self.fc_layer = fc_layer
         name_conv = '.'.join(['conv.' + '.'.join(map(str, l)) for l in self.conv_pool_layer])
         name_fc = '.'.join(['fc.' + '.'.join(map(str, l)) for l in self.fc_layer])
-        self.layer_name = name_conv + '|' + name_fc
-        self._init_model()
-
-    def _init_model(self):
-        '''
-        Initialize convolutional neural network model
-        '''
-        print('Initializing cnn model ...', flush=True)
-        # time series features
-        ts_inputs, ts_layer = [], []
-        for i, tl in enumerate(self.ts_len, 1):
-            ts_in = Input(shape=(tl, 1), name='ts_input' + str(i))
-            ts_inputs.append(ts_in)
-            # convolution layer
-            ts = ts_in
-            for filters, kernel_size, pool_size in self.conv_pool_layer:
-                ts = Conv1D(filters=filters, kernel_size=kernel_size, padding='same', activation='relu', strides=1)(ts)
-                if isinstance(pool_size, int):
-                    if pool_size > 0:
-                        ts = MaxPooling1D(pool_size=pool_size)(ts)
-                    elif pool_size == -1:
-                        ts = GlobalMaxPooling1D()(ts)
-                elif pool_size is not None:
-                    raise ValueError('Unrecognizable pool_size: {}'.format(pool_size))
-            ts = ts if len(K.int_shape(ts)) == 2 else Flatten()(ts)
-            ts_layer.append(ts)
-        # org feature
-        org_input = Input(shape=(self.input_len,), name='org_input')
-        org_layer = Dense(units=128, activation='relu')(org_input)
-        org_layer = Dense(units=64, activation='relu')(org_layer)
-        # fully connected layer
-        fc_layer = Concatenate()(ts_layer + [org_layer])
-        for units, dropout, regularize in self.fc_layer:
-            if regularize is not None:
-                fc_layer = Dense(units=units, activation='relu', kernel_regularizer=l2(regularize), activity_regularizer=l1(regularize))(fc_layer)
-            else:
-                fc_layer = Dense(units=units, activation='relu')(fc_layer)
-            if dropout is not None:
-                fc_layer = Dropout(dropout)(fc_layer)
-        output = Dense(self.output_len, activation='linear')(fc_layer)
-        # model
-        super().build(inputs=ts_inputs+[org_input], outputs=output)
+        self.layer_name = name_conv + '-' + name_fc
+        super()._build(struc='cnn')
 
 ### ========================================================== ###
 ###                           LSTM                             ###
@@ -258,56 +326,44 @@ class lstm(neural_net):
     '''
     Long short term memory model
     '''
-    def __init__(self, ts_len, input_len, output_len, lstm_layer, fc_layer, loss, lr):
+    def __init__(self, ts_len, t_len, geo_len, org_len, output_len, lstm_layer, fc_layer, loss, lr):
         '''
         lstm_layer:
             list of (units, dropout, recurrent_dropout)
         fc_layer:
             list of (units, dropout, regularize)
         '''
-        super().__init__(ts_len=ts_len, input_len=input_len, output_len=output_len, loss=loss, lr=lr)
+        super().__init__(ts_len=ts_len, t_len=t_len, geo_len=geo_len, org_len=org_len, output_len=output_len, loss=loss, lr=lr)
         self.lstm_layer = lstm_layer
         self.fc_layer = fc_layer
         name_lstm = '.'.join(['lstm.' + '.'.join(map(str, l)) for l in self.lstm_layer])
         name_fc = '.'.join(['fc.' + '.'.join(map(str, l)) for l in self.fc_layer])
-        self.layer_name = name_lstm + '|' + name_fc
-        self._init_model()
+        self.layer_name = name_lstm + '-' + name_fc
+        super()._build(struc='lstm')
 
-    def _init_model(self):
+### ========================================================== ###
+###                            CNN                             ###
+### ========================================================== ###
+class cnn_lstm(neural_net):
+    '''
+    Convolutional neural network.
+    '''
+    def __init__(self, ts_len, t_len, geo_len, org_len, output_len, conv_pool_layer, lstm_layer, fc_layer, loss, lr):
         '''
-        Initialize LSTM model
+        conv_pool_layer:
+            list of (filters, kernel_size, pool_size)
+        fc_layer:
+            list of (units, dropout, regularize)
         '''
-        print('Initializing lstm model ...', flush=True)
-        # time series features
-        ts_inputs, ts_layer = [], []
-        for i, tl in enumerate(self.ts_len, 1):
-            ts_in = Input(shape=(tl, 1), name='ts_input' + str(i))
-            ts_inputs.append(ts_in)
-            # lstm layer
-            ts = ts_in
-            for i, (units, drop, rec_drop) in enumerate(self.lstm_layer):
-                if i < len(self.lstm_layer) - 1:
-                    ts = LSTM(units=units, return_sequences=True, dropout=drop, recurrent_dropout=rec_drop)(ts)
-                else:
-                    ts = LSTM(units=units, return_sequences=False, dropout=drop, recurrent_dropout=rec_drop)(ts)
-            ts_layer.append(ts)
-        # org feature
-        org_input = Input(shape=(self.input_len,), name='org_input')
-        org_layer = Dense(units=128, activation='relu')(org_input)
-        org_layer = Dense(units=64, activation='relu')(org_layer)
-        # fully connected layer
-        fc_layer = Concatenate()(ts_layer + [org_layer])
-        for units, dropout, regularize in self.fc_layer:
-            if regularize is not None:
-                fc_layer = Dense(units=units, activation='relu', kernel_regularizer=l2(regularize), activity_regularizer=l1(regularize))(fc_layer)
-            else:
-                fc_layer = Dense(units=units, activation='relu')(fc_layer)
-            if dropout is not None:
-                fc_layer = Dropout(dropout)(fc_layer)
-        output = Dense(self.output_len, activation='linear')(fc_layer)
-        # model
-        super().build(inputs=ts_inputs+[org_input], outputs=output)
-
+        super().__init__(ts_len=ts_len, t_len=t_len, geo_len=geo_len, org_len=org_len, output_len=output_len, loss=loss, lr=lr)
+        self.conv_pool_layer = conv_pool_layer
+        self.lstm_layer = lstm_layer
+        self.fc_layer = fc_layer
+        name_conv = '.'.join(['conv.' + '.'.join(map(str, l)) for l in self.conv_pool_layer])
+        name_lstm = '.'.join(['lstm.' + '.'.join(map(str, l)) for l in self.lstm_layer])
+        name_fc = '.'.join(['fc.' + '.'.join(map(str, l)) for l in self.fc_layer])
+        self.layer_name = name_conv + '-' + name_lstm + '-' + name_fc
+        super()._build(struc = 'cnn_lstm')
 
 ### ========================================================== ###
 ###                           FNN                              ###
@@ -316,54 +372,17 @@ class fnn(neural_net):
     '''
     Feedforward neural network
     '''
-    def __init__(self, ts_len, input_len, output_len, fc_layer_ts, fc_layer, loss, lr):
+    def __init__(self, ts_len, t_len, geo_len, org_len, output_len, fc_layer_ts, fc_layer, loss, lr):
         '''
         fc_layer_ts:
             list of (units, dropout, regularize)
         fc_layer:
             list of (units, dropout, regularize)
         '''
-        super().__init__(ts_len=ts_len, input_len=input_len, output_len=output_len, loss=loss, lr=lr)
+        super().__init__(ts_len=ts_len, t_len=t_len, geo_len=geo_len, org_len=org_len, output_len=output_len, loss=loss, lr=lr)
         self.fc_layer_ts = fc_layer_ts
         self.fc_layer = fc_layer
         name_ts = '.'.join(['fc.' + '.'.join(map(str, l)) for l in self.fc_layer_ts])
         name_fc = '.'.join(['fc.' + '.'.join(map(str, l)) for l in self.fc_layer])
-        self.layer_name = name_ts + '|' + name_fc
-        self._init_model()
-
-    def _init_model(self):
-        '''
-        Initialize feedforward neural network
-        '''
-        print('Initializing feedforward model ...', flush=True)
-        # time series features
-        ts_inputs, ts_layer = [], []
-        for i, tl in enumerate(self.ts_len, 1):
-            ts_in = Input(shape=(tl, 1), name='ts_input' + str(i))
-            ts_inputs.append(ts_in)
-            ts = ts_in if len(K.int_shape(ts_in)) == 2 else Flatten()(ts_in)
-            for units, dropout, regularize in self.fc_layer_ts:
-                if regularize is not None:
-                    ts = Dense(units=units, activation='relu', kernel_regularizer=l2(regularize), activity_regularizer=l1(regularize))(ts)
-                else:
-                    ts = Dense(units=units, activation='relu')(ts)
-                if dropout is not None:
-                    ts = Dropout(dropout)(ts)
-            ts_layer.append(ts)
-        # org feature
-        org_input = Input(shape=(self.input_len,), name='org_input')
-        org_layer = Dense(units=128, activation='relu')(org_input)
-        org_layer = Dense(units=64, activation='relu')(org_layer)
-        # fully connected layer
-        fc_layer = Concatenate()(ts_layer + [org_layer])
-        for units, dropout, regularize in self.fc_layer:
-            if regularize is not None:
-                fc_layer = Dense(units=units, activation='relu', kernel_regularizer=l2(regularize), activity_regularizer=l1(regularize))(fc_layer)
-            else:
-                fc_layer = Dense(units=units, activation='relu')(fc_layer)
-            if dropout is not None:
-                fc_layer = Dropout(dropout)(fc_layer)
-        output = Dense(self.output_len, activation='linear')(fc_layer)
-        # model
-        super().build(inputs=ts_inputs+[org_input], outputs=output)
-
+        self.layer_name = name_ts + '-' + name_fc
+        super()._build(struc='fnn')
