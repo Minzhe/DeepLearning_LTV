@@ -16,14 +16,17 @@ import keras.backend as K
 import tensorflow as tf
 
 #################################    function    ###################################
-def DenseNorm(units, dropout):
+def DenseNorm(units, dropout, name=None):
     model = Sequential()
     model.add(Dense(units))
     model.add(BatchNormalization())
     model.add(ReLU())
     if dropout > 0:
         model.add(Dropout(dropout))
-    model.name = model.name.replace('sequential', 'dense_norm')
+    if name is not None:
+        model.name = name
+    else:
+        model.name = model.name.replace('sequential', 'dense_norm')
     return model
 
 def unit_decay(units, i):
@@ -103,7 +106,7 @@ class neural_net(object):
                     ts = Conv1D(filters=unit_decay(filters, i), kernel_size=kernel_size, padding='same', activation='relu', strides=1)(ts)
                     if pool_size is not None:
                         assert isinstance(pool_size, int) and pool_size > 0, 'Unrecognizable pool_size: {}'.format(pool_size)
-                        ts = MaxPooling1D(pool_size=pool_size)(ts)
+                        ts = MaxPooling1D(pool_size=pool_size, padding='same')(ts)
                 for j, (units, drop, rec_drop) in enumerate(self.lstm_layer):
                     if j < len(self.lstm_layer) - 1:
                         ts = LSTM(units=unit_decay(units, i), return_sequences=True, dropout=drop, recurrent_dropout=rec_drop)(ts)
@@ -122,28 +125,28 @@ class neural_net(object):
         ts_layer = Concatenate()(ts_layer)
         # time modulator features
         t_input = Input(shape=(self.t_len,), name='t_input')
-        time = Dense(8, activation='relu')(t_input)
-        time = Dense(16, activation='relu')(time)
+        time = Dense(16, activation='relu')(t_input)
+        time = Dense(64, activation='relu')(time)
         ts_shape = K.int_shape(ts_layer)[1]
-        gamma = Dense(ts_shape, activation='sigmoid')(time)
-        beta = Dense(ts_shape, activation='tanh')(time)
-        ts_layer = add([multiply([ts_layer, gamma]), beta])
+        gamma = Dense(ts_shape, activation='sigmoid', name='gamma')(time)
+        beta = Dense(ts_shape, activation='tanh', name='beta')(time)
+        ts_layer = add([multiply([ts_layer, gamma]), beta], name='ts_feature')
         # geographical features
         geo_input = Input(shape=(self.geo_len,), name='geo_input')
         geo_layer = DenseNorm(128, 0.2)(geo_input)
-        geo_layer = DenseNorm(64, 0)(geo_layer)
+        geo_layer = DenseNorm(64, 0, name='geo_feature')(geo_layer)
         # org feature
         org_input = Input(shape=(self.org_len,), name='org_input')
-        org_layer = DenseNorm(16, 0.1)(org_input)
-        org_layer = DenseNorm(16, 0)(org_layer)
+        org_layer = DenseNorm(32, 0.2)(org_input)
+        org_layer = DenseNorm(16, 0, name='org_feature')(org_layer)
         # fully connected layer
         fc_layer = Concatenate()([ts_layer, geo_layer, org_layer])
         for units, dropout in self.fc_layer:
             fc_layer = DenseNorm(units, dropout)(fc_layer)
-        output = Dense(self.output_len, activation='linear')(fc_layer)
+        output = Dense(self.output_len, activation='linear', name='output')(fc_layer)
         # model
         model = Model(inputs=ts_inputs + [t_input, geo_input, org_input], outputs=output)
-        model.compile(loss=self.loss, optimizer=Adam(lr=self.lr), metrics=[self.r2, self.mae, self.exp2_mae])
+        model.compile(loss=self.loss, optimizer=Adam(lr=self.lr), metrics=[self.r2, self.exp2_mae])
         print('Model structure summary:', flush=True)
         print(model.summary())
         self.model = model
@@ -170,7 +173,7 @@ class neural_net(object):
 
     def load(self):
         print('Loading neural network model ... ', end='', flush=True)
-        self.model = load_model(self.model_path, custom_objects={'weighted_mse': self.weighted_mse, 'r2': self.r2, 'mae': self.mae, 'exp2_mae': self.exp2_mae})
+        self.model = load_model(self.model_path, custom_objects={'weighted_mse': self.weighted_mse, 'r2': self.r2, 'exp2_mae': self.exp2_mae})
         print('Done')
 
     def predict(self, X, verbose=1, index=0):
@@ -181,6 +184,10 @@ class neural_net(object):
             return y[:, index]
         else:
             raise ValueError('Index out of range.')
+
+    def get_intermediate_layer(self, layer_names, X, verbose=1):
+        intermediate_layer = Model(inputs=self.model.input, outputs=[self.model.get_layer(name).output for name in layer_names])
+        return intermediate_layer.predict(X, verbose=verbose)
 
     def evaluate(self, dgr, name, mode='full', ci=False):
         print('Calculating metrices of {} model ...'.format(name))
@@ -220,18 +227,12 @@ class neural_net(object):
         ptg_pred = np.exp2(y_pred) - 1
         mae = np.mean(np.abs(ptg_true - ptg_pred) * weight)
         mape = np.mean(np.abs(ptg_true - ptg_pred))
-        male = np.mean(np.log2(np.abs(ptg_true - ptg_pred) * weight + 1))
         maple = np.mean(np.abs(y_true - y_pred))
         top10pi = self.top_inclusion(ptg_true, ptg_pred, 10)
-        top10mae = self.top_mae(ptg_true * weight, ptg_pred * weight, weight, 10)
-        top10mape = self.top_mae(ptg_true, ptg_pred, weight, 10)
-        if ci:
-            pci = self.concordance_index(ptg_true, ptg_pred, mode)
-            return pd.Series([mae, male, mape, maple, pci, top10pi, top10mae, top10mape],
-                             index=['MAE', 'MALE', 'MAPE', 'MAPLE', 'PCI', 'PI10', 'MAE10', 'MAPE10'])
-        else:
-            return pd.Series([mae, male, mape, maple, top10pi, top10mae, top10mape],
-                             index=['MAE', 'MALE', 'MAPE', 'MAPLE', 'PI10', 'MAE10', 'MAPE10'])
+        mape250 = self.top_mae(ptg_true, ptg_pred, weight, n=250)
+        mape1000 = self.top_mae(ptg_true, ptg_pred, weight, n=1000)
+        pci = self.concordance_index(ptg_true, ptg_pred, mode) if ci else None
+        return pd.Series([mae, mape, maple, pci, top10pi, mape250, mape1000], index=['MAE', 'MAPE', 'MAPLE', 'PCI', 'PI10', 'MAPE250', 'MAPE1000'])
 
 
     # --------------  utility function  ---------------- #
@@ -263,10 +264,14 @@ class neural_net(object):
         return np.sum(perc_pred & perc_true) / np.sum(perc_true)
 
     @staticmethod
-    def top_mae(y_true, y_pred, base, percentile):
-        cut = np.percentile(base, 100 - percentile)
-        truth = y_true[base > cut]
-        pred = y_pred[base > cut]
+    def top_mae(y_true, y_pred, base, percentile=None, n=None):
+        assert (percentile is None) != (n is None), 'set only either percentile or n.'
+        if percentile is not None:
+            cut = np.percentile(base, 100 - percentile)
+        if n is not None:
+            cut = np.sort(base)[-n]
+        truth = y_true[base >= cut]
+        pred = y_pred[base >= cut]
         return np.mean(np.abs(truth - pred))
 
 
@@ -283,11 +288,6 @@ class neural_net(object):
         y_true = tf.slice(y_true_w, [0, 0], [-1, 1])
         w = tf.slice(y_true_w, [0, 1], [-1, 1])
         return K.mean(K.square(y_true - y_pred) * w)
-
-    @staticmethod
-    def mae(y_true_w, y_pred):
-        y_true = tf.slice(y_true_w, [0, 0], [-1, 1])
-        return K.mean(K.abs(y_true - y_pred))
 
     @staticmethod
     def exp2_mae(y_true_w, y_pred):

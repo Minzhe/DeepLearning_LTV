@@ -10,7 +10,7 @@ import pickle as pkl
 import utility.utility as util
 
 class dataGenerator(object):
-    def __init__(self, gb_data, trip_data, rider_data, org_data, random_state, samples=-1):
+    def __init__(self, gb_data, trip_data, rider_data, org_data, random_state=None, samples=-1):
         # time series data
         print('Parsing gb_data', end='', flush=True)
         self.gb_data = gb_data.loc[gb_data['org_uuid'].isin(org_data['uuid'].tolist()),:]
@@ -39,8 +39,7 @@ class dataGenerator(object):
         self.log_weight = util.truncate(np.array(np.log2(self.weight - min(self.weight) + 2)), upper_bound=15)
         self.org = np.concatenate((self.org,
                                    self.gb_data[['n_invite', 'n_confirm']],
-                                   self.log_weight.reshape(-1, 1),
-                                   self.time_data), axis=1)
+                                   self.log_weight.reshape(-1, 1)), axis=1)
         self.gb_data = self.gb_data.drop(['n_invite', 'n_confirm'], axis=1)
         # reshape time series
         print('Reshaping time series')
@@ -56,16 +55,18 @@ class dataGenerator(object):
         self.week_starting = self.gb_data['week_starting']
         del self.gb_data, self.trip_data, self.rider_data, self.geo_data, self.org_data, self.org
 
-    def split_train_val_test(self, validation_size, test_step, random_state=1234, weight='base'):
+    def split_train_val_test(self, validation_step, test_date, weight='base'):
         print('Spliting training, validation and test dataset ...')
         # test index
-        test_time = self.week_starting.unique()[-test_step:]
-        test_idx = np.array(self.week_starting.isin(test_time))
+        test_idx = np.array(self.week_starting == test_date)
+        assert sum(test_idx) > 0, 'test_date not found.'
         # validation index
-        np.random.seed(random_state)
-        val_idx = np.random.choice(self.y[~test_idx].shape[0], int(self.y[~test_idx].shape[0] * validation_size), replace=False)
-        val_idx = np.array([i in val_idx for i in range(self.y.shape[0])])
+        val_time = np.sort(self.week_starting[self.week_starting < test_date].unique())
+        val_time = val_time[-validation_step:]
+        val_idx = np.array(self.week_starting.isin(val_time))
         train_idx = (~test_idx) & (~val_idx)
+        print('validation time {} to {}'.format(val_time[0], val_time[-1]))
+        print('test time: {}'.format(test_date))
         # combine response and weight
         if weight == 'base':
             resp = np.array([self.y, self.weight / min(self.weight)]).T
