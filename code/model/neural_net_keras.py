@@ -4,13 +4,13 @@
 import os
 import numpy as np
 import pandas as pd
+import pickle as pkl
 from keras.models import Model, load_model, Sequential
 from keras.layers import Input, Dense, ReLU, multiply, add
 from keras.layers import BatchNormalization, Flatten, Concatenate, Dropout
 from keras.layers import Conv1D, MaxPooling1D, GlobalMaxPooling1D, LSTM
 from keras.optimizers import Adam
-from keras.callbacks import EarlyStopping, ModelCheckpoint, TensorBoard, ReduceLROnPlateau
-from keras.regularizers import l1, l2
+from keras.callbacks import EarlyStopping, ModelCheckpoint, TensorBoard, ReduceLROnPlateau, CSVLogger
 from keras.utils import plot_model
 import keras.backend as K
 import tensorflow as tf
@@ -48,13 +48,13 @@ class neural_net(object):
         self.org_len = org_len
         self.input_len = f'{self.ts_len}.{self.t_len}.{self.geo_len}.{self.org_len}'
         self.output_len = output_len
-        assert loss in ['mse', 'weighted_mse'], 'Unrecognizable loss function.'
+        assert loss in ['mse', 'wmse'], 'Unrecognizable loss function.'
         if loss == 'mse':
             self.loss = 'mse'
             self.loss_name = 'mse'
-        elif loss == 'weighted_mse':
-            self.loss = self.weighted_mse
-            self.loss_name = 'weighted_mse'
+        elif loss == 'wmse':
+            self.loss = self.wmse
+            self.loss_name = 'wmse'
         self.lr = lr
         self.conv_pool_layer = []
         self.lstm_layer = []
@@ -125,16 +125,17 @@ class neural_net(object):
         ts_layer = Concatenate()(ts_layer)
         # time modulator features
         t_input = Input(shape=(self.t_len,), name='t_input')
-        time = Dense(16, activation='relu')(t_input)
-        time = Dense(64, activation='relu')(time)
+        time = Dense(8, activation='relu')(t_input)
+        time = Dense(16, activation='relu')(time)
         ts_shape = K.int_shape(ts_layer)[1]
         gamma = Dense(ts_shape, activation='sigmoid', name='gamma')(time)
         beta = Dense(ts_shape, activation='tanh', name='beta')(time)
         ts_layer = add([multiply([ts_layer, gamma]), beta], name='ts_feature')
+        ts_layer = ReLU()(ts_layer)
         # geographical features
         geo_input = Input(shape=(self.geo_len,), name='geo_input')
-        geo_layer = DenseNorm(128, 0.2)(geo_input)
-        geo_layer = DenseNorm(64, 0, name='geo_feature')(geo_layer)
+        geo_layer = DenseNorm(96, 0.2)(geo_input)
+        geo_layer = DenseNorm(48, 0, name='geo_feature')(geo_layer)
         # org feature
         org_input = Input(shape=(self.org_len,), name='org_input')
         org_layer = DenseNorm(32, 0.2)(org_input)
@@ -155,29 +156,46 @@ class neural_net(object):
         self.batch_size = batch_size
         self.epoch = epoch
         self.tol = tolerance
-        self.model_name = f'{model_name}@in.{self.input_len}-out.{self.output_len}-{self.layer_name}-loss.{self.loss_name}-lr.{self.lr}-batch.{self.batch_size}'.replace(' ', '')
-        self.model_path = os.path.join(save_dir, '{}.h5'.format(self.model_name))
-        self.model_fig = os.path.join(save_dir, '{}.png'.format(self.model_name))
+        self.model_name = f'{model_name}@in.{self.input_len}-out.{self.output_len}-{self.layer_name}-loss.{self.loss_name}-batch.{self.batch_size}'.replace(' ', '')
+        self.model_dir = os.path.join(save_dir, self.model_name)
+        if not os.path.isdir(self.model_dir): os.mkdir(self.model_dir)
+        if not os.path.isdir(os.path.join(self.model_dir, 'weight_record')): os.mkdir(os.path.join(self.model_dir, 'weight_record'))
+        self.model_path = os.path.join(self.model_dir, 'model.pkl')
+        self.record_path = os.path.join(self.model_dir, 'weight_record/model-epoch.{epoch:03d}-valloss.{val_loss:.4f}.h5')
+        self.weight_path = os.path.join(self.model_dir, 'weight.h5')
+        self.model_fig = os.path.join(self.model_dir, 'model.png')
+        self.model_log = os.path.join(self.model_dir, 'train_log.csv')
         plot_model(self.model, self.model_fig, show_shapes=True)
-        self.log_dir = os.path.join(save_dir, '{}.log'.format(self.model_name))
-        if not os.path.isdir(self.log_dir): os.mkdir(self.log_dir)
+        with open(self.model_path, 'wb') as f:
+            pkl.dump({'model': self}, file=f)
 
-    def fit(self, X_train, y_train, X_val, y_val):
+    def fit(self, X_train, y_train, X_val, y_val, keep_record=False):
         early_stopper = EarlyStopping(patience=self.tol, verbose=1)
-        check_point = ModelCheckpoint(self.model_path, verbose=1, save_best_only=True)
+        check_point = [ModelCheckpoint(self.weight_path, verbose=1, save_best_only=True)]
+        if keep_record:
+            check_point = check_point + [ModelCheckpoint(self.record_path, verbose=0, save_best_only=False)]
         reduce_learner = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=int(self.tol*0.25), min_lr=1e-4, verbose=1)
-        train_log = TensorBoard(log_dir=self.log_dir)
+        tensorboard = TensorBoard(log_dir=self.model_dir, write_images=True)
+        csv_logger = CSVLogger(self.model_log)
         # fit
-        self.model.fit(X_train, y_train, validation_data=(X_val, y_val), callbacks=[early_stopper, check_point, train_log, reduce_learner],
+        self.model.fit(X_train, y_train, validation_data=(X_val, y_val),
+                       callbacks=check_point + [early_stopper, tensorboard, reduce_learner, csv_logger],
                        batch_size=self.batch_size, epochs=self.epoch, verbose=1, shuffle=True)
 
-    def load(self):
+    @staticmethod
+    def load(path):
+        with open(path, 'rb') as f:
+            return pkl.load(f)['model']
+
+    def load_weight(self):
         print('Loading neural network model ... ', end='', flush=True)
-        self.model = load_model(self.model_path, custom_objects={'weighted_mse': self.weighted_mse, 'r2': self.r2, 'exp2_mae': self.exp2_mae})
+        self.model = load_model(self.weight_path, custom_objects={'wmse': self.wmse, 'r2': self.r2, 'exp2_mae': self.exp2_mae})
         print('Done')
 
-    def predict(self, X, verbose=1, index=0):
+    def predict(self, X, verbose=1, index=0, trunc=True):
         y = self.model.predict(X, verbose=verbose)
+        if trunc:
+            y[y < 0] = 0
         if index == -1:
             return y
         elif index < y.shape[1]:
@@ -185,54 +203,92 @@ class neural_net(object):
         else:
             raise ValueError('Index out of range.')
 
+    # -----------------------   model intermediate layer  ------------------------- #
     def get_intermediate_layer(self, layer_names, X, verbose=1):
-        intermediate_layer = Model(inputs=self.model.input, outputs=[self.model.get_layer(name).output for name in layer_names])
-        return intermediate_layer.predict(X, verbose=verbose)
+        intermediate_layer = Model(inputs=self.model.input, outputs=[self.model.get_layer(name).get_output_at(-1) for name in layer_names])
+        arrs = intermediate_layer.predict(X, verbose=verbose)
+        layers = []
+        for (arr, name) in zip(arrs, layer_names):
+            df = pd.DataFrame(arr, columns=[name + '_' + str(i) for i in range(arr.shape[1])])
+            layers.append(df)
+        return pd.concat(layers, axis=1)
 
+    def kernel_vis(self, layer_name, kernel_index, layer_dim, input_index=0):
+        input_seq = self.model.inputs[input_index]
+        layer_out = self.model.get_layer(layer_name).get_output_at(-1)
+        assert layer_dim in [2,3], 'dimension not correct.'
+        if layer_dim == 3:
+            loss = K.mean(layer_out[:,:, kernel_index])
+        else:
+            loss = K.mean(layer_out[:, kernel_index])
+        grads = K.gradients(loss, input_seq)[0]
+        grads /= (K.sqrt(K.mean(K.square(grads))) + 1e-8)
+        # function evaluator
+        func = K.function([input_seq], [loss, grads])
+        # try at most 3 times if not converged
+        for _ in range(3):
+            # start with random noise
+            x = np.random.random((1,) + K.int_shape(input_seq)[1:])
+            # gradient ascent
+            loss_val = []
+            for i in range(50):
+                tmp_loss, tmp_grad = func([x])
+                loss_val.append(tmp_loss)
+                x += tmp_grad * 0.1
+                if (len(loss_val) > 10) and (abs(np.array(loss_val[-10:])) < 0.01).all():
+                    print('Not converged, trying again ...')
+                    break
+            else:
+                return x.reshape(-1)
+        return x.reshape(-1)
+
+    # -----------------------   model evaluation  ------------------------- #
     def evaluate(self, dgr, name, mode='full', ci=False):
         print('Calculating metrices of {} model ...'.format(name))
         res = dict()
-        res[name+'_train'] = self.cal_metrics(y_true=dgr.resp_train, y_pred=dgr.pred_train, weight=dgr.weight_train, mode=mode, ci=ci)
-        res[name+'_val'] = self.cal_metrics(y_true=dgr.resp_val, y_pred=dgr.pred_val, weight=dgr.weight_val, mode=mode, ci=ci)
-        res[name+'_test'] = self.cal_metrics(y_true=dgr.resp_test, y_pred=dgr.pred_test, weight=dgr.weight_test, mode=mode, ci=ci)
+        res[name+'_train'] = self.cal_metrics(y_true=dgr.train['y'][:,0], y_pred=dgr.train['pred'], weight=dgr.train['base'], mode=mode, ci=ci)
+        res[name+'_val'] = self.cal_metrics(y_true=dgr.val['y'][:,0], y_pred=dgr.val['pred'], weight=dgr.val['base'], mode=mode, ci=ci)
+        res[name+'_test'] = self.cal_metrics(y_true=dgr.test['y'][:,0], y_pred=dgr.test['pred'], weight=dgr.test['base'], mode=mode, ci=ci)
         return pd.DataFrame(res).T
 
     def evaluate_mean_guess(self, dgr, mode='full', ci=False):
         print('Calculating metrices of mean guess model ...')
         res = dict()
-        res['REF_MEAN_train'] = self.cal_metrics(y_true=dgr.resp_train, y_pred=np.ones(shape=dgr.resp_train.shape), weight=dgr.weight_train, mode=mode, ci=ci)
-        res['REF_MEAN_val'] = self.cal_metrics(y_true=dgr.resp_val, y_pred=np.ones(shape=dgr.resp_val.shape), weight=dgr.weight_val, mode=mode, ci=ci)
-        res['REF_MEAN_test'] = self.cal_metrics(y_true=dgr.resp_test, y_pred=np.ones(shape=dgr.resp_test.shape), weight=dgr.weight_test, mode=mode, ci=ci)
+        res['REF_MEAN_train'] = self.cal_metrics(y_true=dgr.train['y'][:,0], y_pred=np.ones(shape=dgr.train['y'][:,0].shape), weight=dgr.train['base'], mode=mode, ci=ci)
+        res['REF_MEAN_val'] = self.cal_metrics(y_true=dgr.val['y'][:,0], y_pred=np.ones(shape=dgr.val['y'][:,0].shape), weight=dgr.val['base'], mode=mode, ci=ci)
+        res['REF_MEAN_test'] = self.cal_metrics(y_true=dgr.test['y'][:,0], y_pred=np.ones(shape=dgr.test['y'][:,0].shape), weight=dgr.test['base'], mode=mode, ci=ci)
         return pd.DataFrame(res).T
 
     def evaluate_gaussian_sample(self, dgr, mode='full', epoch=10, ci=False):
         print('Calculating metrices of gaussian sampling model ', end='', flush=True)
-        pred_train = np.array([np.random.normal(loc=miu, scale=np.sqrt(sigma2), size=epoch) for (miu, sigma2) in zip(dgr.resp_train, dgr.var_train)]).T
-        pred_val = np.array([np.random.normal(loc=miu, scale=np.sqrt(sigma2), size=epoch) for (miu, sigma2) in zip(dgr.resp_val, dgr.var_val)]).T
-        pred_test = np.array([np.random.normal(loc=miu, scale=np.sqrt(sigma2), size=epoch) for (miu, sigma2) in zip(dgr.resp_test, dgr.var_test)]).T
+        pred_train = np.array([np.random.normal(loc=miu, scale=sigma, size=epoch) for (miu, sigma) in zip(dgr.train['y'][:,0], dgr.train['y_sigma'])]).T
+        pred_val = np.array([np.random.normal(loc=miu, scale=sigma, size=epoch) for (miu, sigma) in zip(dgr.val['y'][:,0], dgr.val['y_sigma'])]).T
+        pred_test = np.array([np.random.normal(loc=miu, scale=sigma, size=epoch) for (miu, sigma) in zip(dgr.test['y'][:,0], dgr.test['y_sigma'])]).T
         res = []
         for i in range(epoch):
             print('.', end='', flush=True)
             tmp = dict()
-            tmp['REF_GS_train'] = self.cal_metrics(y_true=dgr.resp_train, y_pred=pred_train[i,:], weight=dgr.weight_train, mode=mode, ci=ci)
-            tmp['REF_GS_val'] = self.cal_metrics(y_true=dgr.resp_val, y_pred=pred_val[i,:], weight=dgr.weight_val, mode=mode, ci=ci)
-            tmp['REF_GS_test'] = self.cal_metrics(y_true=dgr.resp_test, y_pred=pred_test[i,:], weight=dgr.weight_test, mode=mode, ci=ci)
+            tmp['REF_GS_train'] = self.cal_metrics(y_true=dgr.train['y'][:,0], y_pred=pred_train[i,:], weight=dgr.train['base'], mode=mode, ci=ci)
+            tmp['REF_GS_val'] = self.cal_metrics(y_true=dgr.val['y'][:,0], y_pred=pred_val[i,:], weight=dgr.val['base'], mode=mode, ci=ci)
+            tmp['REF_GS_test'] = self.cal_metrics(y_true=dgr.test['y'][:,0], y_pred=pred_test[i,:], weight=dgr.test['base'], mode=mode, ci=ci)
             res.append(pd.DataFrame(tmp).T)
         res = pd.concat(res)
         print(' ')
-        return res.groupby(by=res.index).mean()
+        return res.groupby(by=res.index, sort=False).mean()
 
     def cal_metrics(self, y_true, y_pred, weight, mode, ci):
         ptg_true = np.exp2(y_true) - 1
         ptg_pred = np.exp2(y_pred) - 1
-        mae = np.mean(np.abs(ptg_true - ptg_pred) * weight)
         mape = np.mean(np.abs(ptg_true - ptg_pred))
         maple = np.mean(np.abs(y_true - y_pred))
         top10pi = self.top_inclusion(ptg_true, ptg_pred, 10)
         mape250 = self.top_mae(ptg_true, ptg_pred, weight, n=250)
+        # umape250 = self.top_mae_by_truth(ptg_true * weight, ptg_pred * weight, n=250)
         mape1000 = self.top_mae(ptg_true, ptg_pred, weight, n=1000)
+        # umape1000 = self.top_mae_by_truth(ptg_true * weight, ptg_pred * weight, n=1000)
         pci = self.concordance_index(ptg_true, ptg_pred, mode) if ci else None
-        return pd.Series([mae, mape, maple, pci, top10pi, mape250, mape1000], index=['MAE', 'MAPE', 'MAPLE', 'PCI', 'PI10', 'MAPE250', 'MAPE1000'])
+        return pd.Series([mape, maple, pci, top10pi, mape250, mape1000],
+                         index=['MAPE', 'MAPLE', 'PCI', 'PI10', 'MAPE250', 'MAPE1000'])
 
 
     # --------------  utility function  ---------------- #
@@ -274,6 +330,16 @@ class neural_net(object):
         pred = y_pred[base >= cut]
         return np.mean(np.abs(truth - pred))
 
+    # @staticmethod
+    # def top_mae_by_truth(y_true, y_pred, percentile=None, n=None):
+    #     assert (percentile is None) != (n is None), 'set only either percentile or n.'
+    #     if percentile is not None:
+    #         cut = np.percentile(y_true, 100 - percentile)
+    #     if n is not None:
+    #         cut = np.sort(y_true)[-n]
+    #     truth = y_true[y_true >= cut]
+    #     pred = y_pred[y_true >= cut]
+    #     return np.mean(np.abs(truth - pred) / truth)
 
     # ----------------   tf function   -------------- #
     @staticmethod
@@ -284,7 +350,7 @@ class neural_net(object):
         return 1 - ss_res / (ss_tot + K.epsilon())
 
     @staticmethod
-    def weighted_mse(y_true_w, y_pred):
+    def wmse(y_true_w, y_pred):
         y_true = tf.slice(y_true_w, [0, 0], [-1, 1])
         w = tf.slice(y_true_w, [0, 1], [-1, 1])
         return K.mean(K.square(y_true - y_pred) * w)
@@ -293,8 +359,10 @@ class neural_net(object):
     def exp2_mae(y_true_w, y_pred):
         base = tf.constant(2, dtype='float32')
         y_true = tf.slice(y_true_w, [0, 0], [-1, 1])
-        ratio_true = tf.pow(base, tf.slice(y_true, [0, 0], [-1, 1]))
-        ratio_pred = tf.pow(base, tf.slice(y_pred, [0, 0], [-1, 1]))
+        w = tf.slice(y_true_w, [0, 1], [-1, 1])
+        idx = K.greater(w, 8)
+        ratio_true = tf.pow(base, y_true)[idx]
+        ratio_pred = tf.pow(base, y_pred)[idx]
         return K.mean(K.abs(ratio_true - ratio_pred))
 
 ### ========================================================== ###
@@ -342,7 +410,7 @@ class lstm(neural_net):
         super()._build(struc='lstm')
 
 ### ========================================================== ###
-###                            CNN                             ###
+###                         CNN_LSTM                           ###
 ### ========================================================== ###
 class cnn_lstm(neural_net):
     '''

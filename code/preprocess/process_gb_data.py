@@ -8,6 +8,7 @@ import datetime as dt
 import os
 import sys
 sys.path.append(os.path.join(proj_dir, 'code'))
+import multiprocessing as mp
 import utility.utility as util
 
 ############################    function   ##############################
@@ -15,11 +16,12 @@ class gbDataGenerator(object):
     def __init__(self, df):
         self.raw_data = df
 
-    def create_time_series(self, min_history: int, t0):
-        self.t0 = t0
-        self.min_history = min_history
+    def create_time_series(self, min_history, t0, t1):
         print('Making time series table ...')
-        data = self.raw_data.loc[self.raw_data['week_starting'] >= t0,:]
+        self.t0 = t0
+        self.t1 = t1
+        self.min_history = min_history
+        data = self.raw_data.loc[(self.raw_data['week_starting'] >= t0) & (self.raw_data['week_starting'] <= t1),:]
         org_counts = data['org_uuid'].value_counts()
         orgs = org_counts[org_counts > min_history].index.tolist()
         data = data.loc[data['org_uuid'].isin(orgs),:]
@@ -34,31 +36,36 @@ class gbDataGenerator(object):
         self.invite_confirm = self.invite_ts.merge(self.confirm_ts, how='outer', on=['org_uuid', 'week_starting'])
         self.check_day_consecutive(self.gb_ts.columns.tolist())
 
-    def generate_training_instance(self, w_back: int, w_forecast: int, min_weekly_gb: int):
+    def generate_instance(self, w_back: int, w_forecast: int, min_weekly_gb: int):
         self.w_back = w_back
         self.w_forecast = w_forecast
         self.min_weekly_gb = min_weekly_gb
-        print('Generating gb_ts training instance ...')
-        inst = []
-        for org_uuid, row in self.gb_ts.iterrows():
-            ts, week_starting = self.drop_na_and_first_week(row)
-            inst.append(self.slice_ts_window(ts, self.w_back, self.w_forecast, self.min_weekly_gb, org_uuid, week_starting, 'gb'))
-        self.gb_instance = pd.concat(inst)
-        self.gb_instance = self.gb_instance.merge(self.invite_confirm, how='left', on=['org_uuid', 'week_starting'])
-        print('Generating trip_ts training instance ...')
-        inst = []
-        for org_uuid, row in self.trip_ts.iterrows():
-            ts, week_starting = self.drop_na_and_first_week(row)
-            inst.append(self.slice_ts_window(ts, self.w_back, self.w_forecast, 0, org_uuid, week_starting, 'trip'))
-        self.trip_instance = pd.concat(inst)
-        print('Generating rider_ts training instance ...')
-        inst = []
-        for org_uuid, row in self.rider_ts.iterrows():
-            ts, week_starting = self.drop_na_and_first_week(row)
-            inst.append(self.slice_ts_window(ts, self.w_back, self.w_forecast, 0, org_uuid, week_starting, 'rider'))
-        self.rider_instance = pd.concat(inst)
+        manager = mp.Manager()
+        return_dict = manager.dict()
+        # generating function
+        def inst_generator(df, name, min_val, return_dict):
+            print('Generating {} training instance ...'.format(name))
+            print('Num of orgs: {}, length of weeks: {}'.format(*df.shape))
+            inst = []
+            for org_uuid, row in df.iterrows():
+                ts, week_starting = self.drop_na_and_first_week(row)
+                if len(ts) < (w_back + w_forecast): continue
+                inst.append(self.slice_ts_window(ts, self.w_back, self.w_forecast, min_val, org_uuid, week_starting))
+            return_dict[name] = pd.concat(inst)
+        # multiprocessing
+        jobs = []
+        p = mp.Process(target=inst_generator, args=(self.gb_ts, 'gb', self.min_weekly_gb, return_dict)); jobs.append(p); p.start()
+        p = mp.Process(target=inst_generator, args=(self.trip_ts, 'trip', 0, return_dict)); jobs.append(p); p.start()
+        p = mp.Process(target=inst_generator, args=(self.rider_ts, 'rider', 0, return_dict)); jobs.append(p); p.start()
+        for proc in jobs:
+            proc.join()
+        # store instance
+        self.gb_instance = return_dict['gb'].merge(self.invite_confirm, how='left', on=['org_uuid', 'week_starting'])
+        self.trip_instance = return_dict['trip']
+        self.rider_instance = return_dict['rider']
+        del return_dict
 
-    def sample_train_test_data(self, org_min_sample: int, sample_per_org: int):
+    def sample_instance(self, org_min_sample: int, sample_per_org: int):
         self.org_min_sample = org_min_sample
         self.sample_per_org = sample_per_org
         print('Sampling data for training and testing ...')
@@ -73,16 +80,12 @@ class gbDataGenerator(object):
         if sample_per_org > 1:
             gb_data = gb_data.groupby(by=['org_uuid'], as_index=False).apply(lambda df: df.loc[np.random.choice(df.index.tolist(), sample_per_org, replace=False),:])
             gb_data = gb_data.reset_index().drop(['level_0', 'level_1'], axis=1)
-        self.gb_data, self.trip_data, self.rider_data = self.get_common_org_week(gb_data, self.trip_instance, self.rider_instance, self.t0)
+        self.ts_data = self.get_common_org_week(gb_data, self.trip_instance, self.rider_instance, self.t0)
 
-    def write_out(self, dir_path):
+    def write_out(self, dir_path, name):
         print('Writing output ...')
-        gb_path = os.path.join(dir_path, f'weekly_loggb_wb{self.w_back}_wf_{self.w_forecast}_mh{self.min_history}_ms{self.org_min_sample}_spo{self.sample_per_org}.csv')
-        trip_path = os.path.join(dir_path, f'weekly_logtrip_wb{self.w_back}_wf_{self.w_forecast}_mh{self.min_history}_ms{self.org_min_sample}_spo{self.sample_per_org}.csv')
-        rider_path = os.path.join(dir_path, f'weekly_logrider_wb{self.w_back}_wf_{self.w_forecast}_mh{self.min_history}_ms{self.org_min_sample}_spo{self.sample_per_org}.csv')
-        self.gb_data.to_csv(gb_path, index=None)
-        self.trip_data.to_csv(trip_path, index=None)
-        self.rider_data.to_csv(rider_path, index=None)
+        ts_path = os.path.join(dir_path, f'weekly_ts_{name}_wb{self.w_back}_wf{self.w_forecast}_mh{self.min_history}_mgb{self.min_weekly_gb}.csv')
+        self.ts_data.to_csv(ts_path, index=None)
 
     # *****************   help function   *************** #
     @staticmethod
@@ -95,27 +98,29 @@ class gbDataGenerator(object):
         gb_data = gb_data.loc[index,:].reset_index(drop=True)
         trip_data = trip_data.loc[index,:].reset_index(drop=True)
         rider_data = rider_data.loc[index,:].reset_index(drop=True)
-        gb_data.loc[:,'week_starting'] = gb_data['week_starting'].apply(lambda x: (dt.timedelta(x) + t0).strftime('%Y-%m-%d'))
-        trip_data.loc[:,'week_starting'] = trip_data['week_starting'].apply(lambda x: (dt.timedelta(x) + t0).strftime('%Y-%m-%d'))
-        rider_data.loc[:,'week_starting'] = rider_data['week_starting'].apply(lambda x: (dt.timedelta(x) + t0).strftime('%Y-%m-%d'))
-        return gb_data, trip_data, rider_data
+        gb_data.insert(0, 'ts', 'gb'); trip_data.insert(0, 'ts', 'trip'); rider_data.insert(0, 'ts', 'rider')
+        print('Merging gb, trip and rider data ...')
+        ts_data = gb_data.merge(trip_data, how='outer').merge(rider_data, how='outer')
+        ts_data = ts_data.sort_values(by=['week_starting', 'org_uuid', 'ts'])
+        ts_data.loc[:, 'week_starting'] = ts_data['week_starting'].apply(lambda x: (dt.timedelta(x) + t0).strftime('%Y-%m-%d'))
+        return ts_data
 
     @staticmethod
-    def slice_ts_window(arr, w_b, w_f, min_base, org_uuid, week_starting, name):
+    def slice_ts_window(arr, w_b, w_f, min_base, org_uuid, week_starting):
         inst = []
         for s in range(0, len(arr) - w_b - w_f + 1):
-            week = week_starting + s * 7
+            week = week_starting + (s + w_b) * 7
             time_window = arr[s:s + w_b]
             forecast_window = arr[s + w_b:s + w_b + w_f]
             base = np.mean(time_window)
             if base <= min_base: continue
             # normalize by the base value
             time_window = np.log2(time_window / base + 1)
-            gb = np.mean(np.log2(forecast_window / base + 1))                   # sample mean: miu
-            gb_var = np.var(np.log2(forecast_window / base + 1), ddof=1) / w_f    # variance of sample mean: miu = sigma2 / n
-            tmp = np.concatenate(([week, base, gb, gb_var], time_window))
-            inst.append([org_uuid] + list(np.round(tmp, 6)))
-        return pd.DataFrame(inst, columns=['org_uuid', 'week_starting', 'base', 'log{}'.format(name), 'log{}_var'.format(name)] + ['t_' + str(i) for i in range(w_b)])
+            gb = np.log2(np.mean(forecast_window / base) + 1)                         # !!! take mean first, then log transform
+            gb_sigma = np.sqrt(np.var(forecast_window / base, ddof=1) / w_f)          # variance of sample mean: miu = sigma2 / n
+            tmp = np.concatenate(([week, base, gb, gb_sigma], time_window))
+            inst.append([org_uuid] + list(np.round(tmp, 4)))
+        return pd.DataFrame(inst, columns=['org_uuid', 'week_starting', 'base', 'logratio', 'sigma'] + ['t_' + str(i) for i in range(w_b)])
 
     @staticmethod
     def drop_na_and_first_week(arr):
@@ -127,7 +132,7 @@ class gbDataGenerator(object):
                 else:
                     ts = arr.iloc[i:]
                     return np.array(ts), ts.index[0]
-        return []
+        return [], None
 
     @staticmethod
     def check_day_consecutive(arr):
@@ -138,11 +143,22 @@ class gbDataGenerator(object):
 ###########################    main   ###########################
 data_path = os.path.join(proj_dir, 'data/processed/weekly_gb.csv')
 data = pd.read_csv(data_path, parse_dates=[0])
+# -------------------- 52 weeks data -------------------- #
+# make training and validation
 dgr = gbDataGenerator(data)
-dgr.create_time_series(min_history=65, t0=dt.datetime(2016, 1, 3))
-dgr.generate_training_instance(w_back=13, w_forecast=52, min_weekly_gb=50)
-dgr.sample_train_test_data(org_min_sample=5, sample_per_org=-1)
+dgr.create_time_series(min_history=52, t0=dt.datetime(2014, 4, 27), t1=dt.datetime(2018, 9, 30))
+dgr.generate_instance(w_back=52, w_forecast=52, min_weekly_gb=20)
+dgr.sample_instance(org_min_sample=-1, sample_per_org=-1)
 out_dir = os.path.join(proj_dir, 'data/processed/')
-dgr.write_out(out_dir)
+dgr.write_out(out_dir, 'train')
+# make test
+# dgr = gbDataGenerator(data)
+# test_time = dt.datetime(2018, 4, 1)
+# dgr.create_time_series(min_history=2, t0=test_time-dt.timedelta(7*53), t1=test_time+dt.timedelta(7*51))
+# dgr.generate_instance(w_back=52, w_forecast=52, min_weekly_gb=0)
+# dgr.sample_instance(org_min_sample=-1, sample_per_org=-1)
+# out_dir = os.path.join(proj_dir, 'data/processed/')
+# dgr.write_out(out_dir, 'test')
+
 
 

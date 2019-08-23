@@ -40,3 +40,9 @@ def plot_corr(truth, pred, ax, title='', lims=None):
 
 def plot_density(x, ax):
     sns.distplot(x, ax=ax)
+
+def plot_scatter(x, y, fig_path, s=None, c=None, cmap=None):
+    fig, ax = plt.subplots(figsize=(12, 10))
+    im = ax.scatter(x, y, s=s, c=c, cmap=cmap)
+    fig.colorbar(im, ax=ax)
+    fig.savefig(fig_path, transparent=True)
